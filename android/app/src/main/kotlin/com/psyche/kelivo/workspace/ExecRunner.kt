@@ -37,6 +37,7 @@ class ExecRunner(
     fun start(request: ExecRequest) {
         cancel(request.runId)
         request.tmpDir.mkdirs()
+        ProotCommand.l2sDirectory(request.rootfsDir).mkdirs()
         ProotCommand.stageTalloc(request.nativeLibDir, request.tmpDir)
         RootfsCertificates.ensureInstalled(request.rootfsDir)
         val launch = ProotCommand.build(

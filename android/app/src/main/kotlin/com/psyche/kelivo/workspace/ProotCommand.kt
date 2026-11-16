@@ -112,6 +112,10 @@ object ProotCommand {
             "PROOT_LOADER" to File(nativeLibDir, LOADER_LIB).absolutePath,
             "PROOT_TMP_DIR" to tmpDir.absolutePath,
             "TMPDIR" to tmpDir.absolutePath,
+            // Keep link2symlink backing files out of user directories. Scattering
+            // them next to the linked file lets `rm -rf dir` delete them first,
+            // leaving the visible hard link dangling.
+            "PROOT_L2S_DIR" to l2sDirectory(rootfsDir).absolutePath,
         )
         if (includeLibraryPath) {
             processEnv["LD_LIBRARY_PATH"] =
@@ -124,6 +128,10 @@ object ProotCommand {
             workingDirectory = rootfsDir.parentFile ?: rootfsDir,
         )
     }
+
+    /** Sibling of the rootfs; PRoot expects it to already exist. */
+    fun l2sDirectory(rootfsDir: File): File =
+        File(rootfsDir.absoluteFile.parentFile ?: rootfsDir.absoluteFile, "l2s")
 
     /** Copy libtalloc.so to the SONAME proot actually DT_NEEDs. */
     fun stageTalloc(nativeLibDir: File, tmpDir: File) {

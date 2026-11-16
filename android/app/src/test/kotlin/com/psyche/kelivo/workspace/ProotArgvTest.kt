@@ -1,6 +1,7 @@
 package com.psyche.kelivo.workspace
 
 import java.io.File
+import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -35,6 +36,7 @@ class ProotArgvTest {
         assertEquals("/nativelib/libproot_loader.so", launch.processEnv["PROOT_LOADER"])
         assertEquals("/data/tmp", launch.processEnv["PROOT_TMP_DIR"])
         assertEquals("/data/tmp", launch.processEnv["TMPDIR"])
+        assertEquals("/data/l2s", launch.processEnv["PROOT_L2S_DIR"])
         assertEquals("/data/tmp:/nativelib", launch.processEnv["LD_LIBRARY_PATH"])
     }
 
@@ -160,6 +162,19 @@ class ProotArgvTest {
                 assertEquals("-r", launch.argv[4 + args.size])
                 assertFalse(launch.argv.contains("--kernel-release=4.19.198"))
             }
+        }
+    }
+
+    @Test
+    fun l2sDirectorySitsNextToTheRootfsOutsideIt() {
+        val base = Files.createTempDirectory("kelivo-l2s").toFile()
+        try {
+            val rootfs = File(base, "environment/rootfs").apply { mkdirs() }
+            val l2s = ProotCommand.l2sDirectory(rootfs)
+            assertEquals(File(base, "environment/l2s").absolutePath, l2s.absolutePath)
+            assertTrue(l2s.mkdirs())
+        } finally {
+            base.deleteRecursively()
         }
     }
 
