@@ -39,7 +39,9 @@ import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.StandardOpenOption
+import java.text.SimpleDateFormat
 import java.time.Duration
+import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], manifest = Config.NONE)
@@ -54,6 +56,7 @@ class WorkspaceDocumentsProviderTest {
         appData = context.getDir("flutter", Context.MODE_PRIVATE).canonicalFile
         database = SQLiteDatabase.openOrCreateDatabase(File(appData, "kelivo.db"), null)
         database.execSQL("CREATE TABLE extension_entity_rows (kind TEXT, id TEXT, sort_order INTEGER, payload TEXT, PRIMARY KEY (kind, id))")
+        database.execSQL("CREATE TABLE conversation_rows (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)")
         database.enableWriteAheadLogging()
         provider = WorkspaceDocumentsProvider()
         provider.attachInfo(context, ProviderInfo().apply {
@@ -84,6 +87,25 @@ class WorkspaceDocumentsProviderTest {
         val values = mutableListOf<String>()
         while (moveToNext()) values += getString(getColumnIndexOrThrow(column))
         values
+    }
+
+    private fun workspaceChildren(): Cursor = children(WorkspaceDocumentPaths.CATEGORY_WORKSPACES)
+
+    private fun session(
+        id: String,
+        createdAtMicros: Long? = null,
+        withOutputs: Boolean = true,
+    ): File {
+        val directory = File(appData, "sessions/$id").apply { mkdirs() }
+        File(directory, "attachments").mkdirs()
+        if (withOutputs) File(directory, "outputs").mkdirs()
+        if (createdAtMicros != null) {
+            database.execSQL(
+                "INSERT OR REPLACE INTO conversation_rows VALUES (?, ?)",
+                arrayOf<Any?>(id, createdAtMicros),
+            )
+        }
+        return directory
     }
 
     @Test
@@ -123,13 +145,31 @@ class WorkspaceDocumentsProviderTest {
         workspace()
         workspace("two", "另一个工作区")
         assertEquals(listOf("Kelivo"), provider.queryRoots(null).strings(Root.COLUMN_TITLE))
-        assertEquals(listOf("工作区一", "另一个工作区"), children().strings(Document.COLUMN_DISPLAY_NAME))
+        assertEquals(listOf("工作区一", "另一个工作区"), workspaceChildren().strings(Document.COLUMN_DISPLAY_NAME))
         assertTrue(File(appData, "kelivo.db").exists())
+    }
+
+    @Test
+    fun exposesFourCategoriesAtTheRoot() {
+        assertEquals(
+            listOf("工作区", "聊天输出", "会话", "rootfs"),
+            children().strings(Document.COLUMN_DISPLAY_NAME),
+        )
+        assertEquals(
+            listOf(
+                WorkspaceDocumentPaths.CATEGORY_WORKSPACES,
+                WorkspaceDocumentPaths.CATEGORY_OUTPUTS,
+                WorkspaceDocumentPaths.CATEGORY_SESSIONS,
+                WorkspaceDocumentPaths.CATEGORY_ROOTFS,
+            ),
+            children().strings(Document.COLUMN_DOCUMENT_ID),
+        )
     }
 
     @Test
     fun honorsRequestedProjectionsAndCreateFlags() {
         workspace()
+        WorkspaceDocumentPaths.rootfsDirectory(appData).mkdirs()
         provider.queryRoots(arrayOf(Root.COLUMN_TITLE, Root.COLUMN_FLAGS)).use {
             assertEquals(2, it.columnCount)
             assertTrue(it.moveToFirst())
@@ -141,6 +181,14 @@ class WorkspaceDocumentsProviderTest {
             assertEquals(0, it.getInt(it.getColumnIndexOrThrow(Document.COLUMN_FLAGS)) and Document.FLAG_DIR_SUPPORTS_CREATE)
         }
         children().use {
+            assertTrue(it.moveToFirst())
+            assertEquals(0, it.getInt(it.getColumnIndexOrThrow(Document.COLUMN_FLAGS)) and Document.FLAG_DIR_SUPPORTS_CREATE)
+        }
+        children(WorkspaceDocumentPaths.CATEGORY_WORKSPACES).use {
+            assertTrue(it.moveToFirst())
+            assertTrue(it.getInt(it.getColumnIndexOrThrow(Document.COLUMN_FLAGS)) and Document.FLAG_DIR_SUPPORTS_CREATE != 0)
+        }
+        children(WorkspaceDocumentPaths.CATEGORY_ROOTFS).use {
             assertTrue(it.moveToFirst())
             assertTrue(it.getInt(it.getColumnIndexOrThrow(Document.COLUMN_FLAGS)) and Document.FLAG_DIR_SUPPORTS_CREATE != 0)
         }
@@ -311,11 +359,11 @@ class WorkspaceDocumentsProviderTest {
     fun observesRegistryChangesOnTheNextQueryAndRevokesDeletedWorkspaceIds() {
         val root = workspace()
         File(root, "hello.txt").writeText("hello")
-        assertEquals(listOf("工作区一"), children().strings(Document.COLUMN_DISPLAY_NAME))
+        assertEquals(listOf("工作区一"), workspaceChildren().strings(Document.COLUMN_DISPLAY_NAME))
         workspace(name = "改名后")
-        assertEquals(listOf("改名后"), children().strings(Document.COLUMN_DISPLAY_NAME))
+        assertEquals(listOf("改名后"), workspaceChildren().strings(Document.COLUMN_DISPLAY_NAME))
         database.execSQL("DELETE FROM extension_entity_rows WHERE id = 'one'")
-        assertTrue(children().strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
+        assertTrue(workspaceChildren().strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
         assertThrows(FileNotFoundException::class.java) { provider.openDocument("workspace/one/hello.txt", "r", null) }
         assertTrue(File(root, "hello.txt").exists())
     }
@@ -440,7 +488,7 @@ class WorkspaceDocumentsProviderTest {
         workspace()
         workspace("linked", kind = "linked")
         workspace("../bad")
-        assertEquals(listOf("workspace/one"), children().strings(Document.COLUMN_DOCUMENT_ID))
+        assertEquals(listOf("workspace/one"), workspaceChildren().strings(Document.COLUMN_DOCUMENT_ID))
         assertThrows(FileNotFoundException::class.java) { provider.queryDocument("workspace/linked/kelivo.db", null) }
     }
 
@@ -473,14 +521,14 @@ class WorkspaceDocumentsProviderTest {
         val root = workspace()
         root.delete()
         Files.createSymbolicLink(root.toPath(), appData.toPath())
-        assertTrue(children().strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
+        assertTrue(workspaceChildren().strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
         assertThrows(FileNotFoundException::class.java) { provider.queryDocument("workspace/one/kelivo.db", null) }
     }
 
     @Test
     fun aWorkspaceWithoutRestoredFilesRemainsAnEmptyFolder() {
         workspace().delete()
-        assertEquals(listOf("工作区一"), children().strings(Document.COLUMN_DISPLAY_NAME))
+        assertEquals(listOf("工作区一"), workspaceChildren().strings(Document.COLUMN_DISPLAY_NAME))
         assertTrue(children("workspace/one").strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
         assertEquals(Document.MIME_TYPE_DIR, provider.getDocumentType("workspace/one"))
     }
@@ -490,12 +538,97 @@ class WorkspaceDocumentsProviderTest {
         database.close()
         val file = File(appData, "kelivo.db")
         file.delete()
-        assertTrue(children().strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
+        assertTrue(workspaceChildren().strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
         assertFalse(file.exists())
         file.writeText("not a sqlite database")
         val before = file.readBytes()
-        assertTrue(children().strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
+        assertTrue(workspaceChildren().strings(Document.COLUMN_DOCUMENT_ID).isEmpty())
         assertArrayEquals(before, file.readBytes())
+    }
+
+    @Test
+    fun listsSessionsNewestFirstWithCreationTimeAndShortId() {
+        val format = SimpleDateFormat("yyyyMMddHHmmss", Locale.US)
+        val older = format.parse("20260817095830")!!
+        val newer = format.parse("20260901120000")!!
+        val olderId = "abcdef12-1234-5678-9abc-def012345678"
+        val olderDir = session(olderId, older.time * 1000)
+        File(olderDir, "notes.txt").writeText("hello")
+        session("deadbeef-aaaa", newer.time * 1000)
+
+        children(WorkspaceDocumentPaths.CATEGORY_SESSIONS).use { cursor ->
+            assertEquals(
+                listOf("20260901120000-deadbeef", "20260817095830-abcdef12"),
+                cursor.strings(Document.COLUMN_DISPLAY_NAME),
+            )
+        }
+        assertEquals(
+            Document.MIME_TYPE_DIR,
+            provider.getDocumentType(WorkspaceDocumentPaths.sessionDocumentId(olderId)),
+        )
+        assertEquals(
+            listOf("attachments", "outputs", "notes.txt"),
+            children(WorkspaceDocumentPaths.sessionDocumentId(olderId)).strings(Document.COLUMN_DISPLAY_NAME),
+        )
+    }
+
+    @Test
+    fun sessionWithoutARegistryRowIsStillListed() {
+        session("norow-1")
+        assertEquals(
+            listOf(WorkspaceDocumentPaths.sessionDocumentId("norow-1")),
+            children(WorkspaceDocumentPaths.CATEGORY_SESSIONS).strings(Document.COLUMN_DOCUMENT_ID),
+        )
+    }
+
+    @Test
+    fun chatOutputsExposeOnlySessionsThatHaveOutputs() {
+        val withOutputs = "abcdef12-1234"
+        val directory = session(withOutputs, 0L)
+        File(directory, "outputs/report.txt").writeText("report")
+        session("noout-1", withOutputs = false)
+
+        assertEquals(
+            listOf(WorkspaceDocumentPaths.outputDocumentId(withOutputs)),
+            children(WorkspaceDocumentPaths.CATEGORY_OUTPUTS).strings(Document.COLUMN_DOCUMENT_ID),
+        )
+        assertEquals(
+            listOf("report.txt"),
+            children(WorkspaceDocumentPaths.outputDocumentId(withOutputs)).strings(Document.COLUMN_DISPLAY_NAME),
+        )
+    }
+
+    @Test
+    fun rootfsCategoryIsWritable() {
+        val rootfs = WorkspaceDocumentPaths.rootfsDirectory(appData).apply { mkdirs() }
+        File(rootfs, "bin").mkdirs()
+        File(rootfs, "etc").mkdirs()
+        File(rootfs, "etc/os-release").writeText("Kelivo")
+
+        assertEquals(listOf("bin", "etc"), children(WorkspaceDocumentPaths.CATEGORY_ROOTFS).strings(Document.COLUMN_DISPLAY_NAME))
+        assertEquals("rootfs/etc/os-release", provider.createDocument(WorkspaceDocumentPaths.CATEGORY_ROOTFS, "text/plain", "note.txt"))
+        assertTrue(File(rootfs, "note.txt").isFile)
+        assertEquals("rootfs/bin/tools", provider.createDocument("rootfs/bin", Document.MIME_TYPE_DIR, "tools"))
+        assertTrue(File(rootfs, "bin/tools").isDirectory)
+        assertEquals(listOf("bin", "etc", "note.txt"), children(WorkspaceDocumentPaths.CATEGORY_ROOTFS).strings(Document.COLUMN_DISPLAY_NAME))
+    }
+
+    @Test
+    fun sessionsCanBeDeletedButNotRenamed() {
+        val id = "abcdef12-1234"
+        val directory = session(id, 0L)
+        File(directory, "outputs/out.txt").writeText("out")
+        children(WorkspaceDocumentPaths.CATEGORY_SESSIONS).use {
+            assertTrue(it.moveToFirst())
+            val flags = it.getInt(it.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+            assertTrue(flags and Document.FLAG_SUPPORTS_DELETE != 0)
+            assertEquals(0, flags and Document.FLAG_SUPPORTS_RENAME)
+        }
+        assertThrows(FileNotFoundException::class.java) {
+            provider.renameDocument(WorkspaceDocumentPaths.sessionDocumentId(id), "renamed")
+        }
+        provider.deleteDocument(WorkspaceDocumentPaths.sessionDocumentId(id))
+        assertFalse(directory.exists())
     }
 
     @Test

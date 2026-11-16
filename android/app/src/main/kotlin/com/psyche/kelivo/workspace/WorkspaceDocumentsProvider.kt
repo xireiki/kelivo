@@ -24,16 +24,39 @@ import java.io.IOException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-/** Workspace files in the Android system document picker. */
+/** Kelivo files in the Android system document picker. */
 class WorkspaceDocumentsProvider : DocumentsProvider() {
     private lateinit var appData: File
     private lateinit var store: WorkspaceDocumentsStore
     private val directoryObservers = DirectoryObservers()
     private val authority: String get() = requireNotNull(context).packageName + ".workspace.documents"
+
+    private val workspacesDir: File
+        get() = WorkspaceDocumentPaths.workspacesDirectory(appData)
+    private val sessionsDir: File
+        get() = WorkspaceDocumentPaths.sessionsDirectory(appData)
+    private val rootfsDir: File
+        get() = WorkspaceDocumentPaths.rootfsDirectory(appData)
+
+    private data class DocumentEntry(
+        val id: String,
+        val name: String,
+        val file: File,
+        val root: File,
+        val isDirectory: Boolean,
+        val supportsCreate: Boolean = false,
+        val supportsWrite: Boolean = false,
+        val supportsDelete: Boolean = false,
+        val supportsRename: Boolean = false,
+    )
 
     override fun onCreate(): Boolean {
         // path_provider_android's getApplicationDocumentsDirectory uses this directory.
@@ -57,17 +80,7 @@ class WorkspaceDocumentsProvider : DocumentsProvider() {
 
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor =
         MatrixCursor(projection ?: DOCUMENT_COLUMNS).apply {
-            if (documentId == WorkspaceDocumentPaths.ROOT) {
-                addValues(mapOf(
-                    Document.COLUMN_DOCUMENT_ID to documentId,
-                    Document.COLUMN_DISPLAY_NAME to "Kelivo",
-                    Document.COLUMN_MIME_TYPE to Document.MIME_TYPE_DIR,
-                    Document.COLUMN_FLAGS to if (Build.VERSION.SDK_INT >= 30) Document.FLAG_DIR_BLOCKS_OPEN_DOCUMENT_TREE else 0,
-                ))
-            } else {
-                val (root, relative, file) = resolve(documentId)
-                addDocument(root, relative, file)
-            }
+            addDocument(describe(documentId))
         }
 
     override fun queryChildDocuments(
@@ -81,24 +94,44 @@ class WorkspaceDocumentsProvider : DocumentsProvider() {
             // A rename/delete in Flutter is committed to the same WAL. Watching
             // it keeps the picker current without publishing a second registry.
             cursor.watch(appData) { it == "kelivo.db" || it == "kelivo.db-wal" }
-            if (parentDocumentId == WorkspaceDocumentPaths.ROOT) {
-                for (root in store.list()) cursor.addDocument(root, "", root.directory)
-            } else {
-                val (root, relative, directory) = resolve(parentDocumentId)
-                if (relative.isNotEmpty() && !directory.isDirectory) throw FileNotFoundException("Not a directory")
-                cursor.watch(directory) { true }
-                val files = directory.listFiles().orEmpty().filterNot { it.name.startsWith(".l2s.") }.sortedWith(
-                    compareBy<File> { !it.isDirectory }.thenBy { it.name.lowercase() },
-                )
-                for (child in files) {
-                    val path = if (relative.isEmpty()) child.name else "$relative/${child.name}"
-                    try {
-                        val file = WorkspaceDocumentPaths.resolve(root, path)
-                        cursor.addDocument(root, path, file)
-                    } catch (_: IOException) {
-                        // Files may disappear while enumerating. Escaping links
-                        // and non-regular files are intentionally not exposed.
+            when (val target = parseOrThrow(parentDocumentId)) {
+                DocumentTarget.Root -> {
+                    for (id in WorkspaceDocumentPaths.CATEGORIES) {
+                        cursor.addDocument(categoryEntry(id))
                     }
+                }
+                is DocumentTarget.Category -> when (target.id) {
+                    WorkspaceDocumentPaths.CATEGORY_WORKSPACES -> {
+                        cursor.watch(workspacesDir) { true }
+                        for (workspace in store.list()) cursor.addDocument(workspaceEntry(workspace))
+                    }
+                    WorkspaceDocumentPaths.CATEGORY_SESSIONS -> {
+                        cursor.watch(sessionsDir) { true }
+                        for (entry in conversationEntries(outputsOnly = false)) {
+                            cursor.addDocument(entry)
+                        }
+                    }
+                    WorkspaceDocumentPaths.CATEGORY_OUTPUTS -> {
+                        cursor.watch(sessionsDir) { true }
+                        for (entry in conversationEntries(outputsOnly = true)) {
+                            cursor.addDocument(entry)
+                        }
+                    }
+                    WorkspaceDocumentPaths.CATEGORY_ROOTFS -> {
+                        val parent = describe(parentDocumentId)
+                        if (Files.isDirectory(parent.file.toPath())) {
+                            cursor.watch(parent.file) { true }
+                        }
+                        addChildren(cursor, target, parent)
+                    }
+                    else -> throw FileNotFoundException("Unknown category")
+                }
+                else -> {
+                    val parent = describe(parentDocumentId)
+                    if (Files.isDirectory(parent.file.toPath())) {
+                        cursor.watch(parent.file) { true }
+                    }
+                    addChildren(cursor, target, parent)
                 }
             }
             return cursor
@@ -109,17 +142,19 @@ class WorkspaceDocumentsProvider : DocumentsProvider() {
     }
 
     override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
-        val (root, parentRelative, parent) = resolve(parentDocumentId)
-        if (!parent.isDirectory) throw FileNotFoundException("Not a directory")
+        val parent = describe(parentDocumentId)
+        if (!parent.isDirectory || !parent.supportsCreate) {
+            throw FileNotFoundException("Not a directory")
+        }
         val name = displayName.trim()
         if (!WorkspaceDocumentPaths.validFileName(name)) throw IllegalArgumentException("Invalid document name")
-        var target = File(parent, name)
+        var target = File(parent.file, name)
         var counter = 2
-        while (target.exists()) {
+        while (Files.exists(target.toPath(), NOFOLLOW_LINKS)) {
             val dot = name.lastIndexOf('.')
             val candidate = if (dot <= 0) "$name ($counter)"
                 else "${name.substring(0, dot)} ($counter)${name.substring(dot)}"
-            target = File(parent, candidate)
+            target = File(parent.file, candidate)
             counter++
         }
         val created = if (mimeType == Document.MIME_TYPE_DIR) {
@@ -128,49 +163,41 @@ class WorkspaceDocumentsProvider : DocumentsProvider() {
             target.createNewFile()
         }
         if (!created) throw IOException("Unable to create document")
-        val relative = if (parentRelative.isEmpty()) target.name else "$parentRelative/${target.name}"
         requireNotNull(context).contentResolver.notifyChange(
             DocumentsContract.buildChildDocumentsUri(authority, parentDocumentId), null,
         )
-        return WorkspaceDocumentPaths.documentId(root.id, relative)
+        return childId(parseOrThrow(parentDocumentId), target.name)
     }
 
     override fun renameDocument(documentId: String, displayName: String): String? {
-        val (root, relative, source) = resolve(documentId)
-        if (relative.isEmpty()) throw FileNotFoundException("Cannot rename a workspace")
+        val source = describe(documentId, followLeaf = false)
+        if (!source.supportsRename) throw FileNotFoundException("Cannot rename document")
         val name = displayName.trim()
         if (!WorkspaceDocumentPaths.validFileName(name)) throw IllegalArgumentException("Invalid document name")
-        if (name == source.name) return null
-        val parent = source.parentFile ?: throw FileNotFoundException("No parent directory")
+        if (name == source.file.name) return null
+        val parent = source.file.parentFile ?: throw FileNotFoundException("No parent directory")
         val target = File(parent, name)
-        if (target.exists()) throw FileAlreadyExistsException(target)
-        if (!source.renameTo(target)) throw IOException("Unable to rename document")
-        val parentId = WorkspaceDocumentPaths.documentId(root.id, relative.substringBeforeLast('/', ""))
-        val targetRelative = if (relative.contains('/')) {
-            "${relative.substringBeforeLast('/')}/$name"
-        } else {
-            name
-        }
+        if (Files.exists(target.toPath(), NOFOLLOW_LINKS)) throw FileAlreadyExistsException(target)
+        if (!source.file.renameTo(target)) throw IOException("Unable to rename document")
         val resolver = requireNotNull(context).contentResolver
-        resolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority, parentId), null)
+        resolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority, parentDocumentId(documentId)), null)
         resolver.notifyChange(DocumentsContract.buildDocumentUri(authority, documentId), null)
-        return WorkspaceDocumentPaths.documentId(root.id, targetRelative)
+        return renamedId(documentId, name)
     }
 
     override fun deleteDocument(documentId: String) {
-        val (root, relative, file) = resolve(documentId)
-        if (relative.isEmpty()) throw FileNotFoundException("Cannot delete a workspace")
-        deleteTree(file.toPath())
-        val parentId = WorkspaceDocumentPaths.documentId(root.id, relative.substringBeforeLast('/', ""))
+        val entry = describe(documentId, followLeaf = false)
+        if (!entry.supportsDelete) throw FileNotFoundException("Cannot delete document")
+        deleteTree(entry.file.toPath())
         val resolver = requireNotNull(context).contentResolver
-        resolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority, parentId), null)
+        resolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority, parentDocumentId(documentId)), null)
         resolver.notifyChange(DocumentsContract.buildDocumentUri(authority, documentId), null)
     }
 
     override fun openDocument(documentId: String, mode: String, signal: CancellationSignal?): ParcelFileDescriptor {
         signal?.throwIfCanceled()
-        val (root, relative, file) = resolve(documentId)
-        if (relative.isEmpty() || !file.isFile) throw FileNotFoundException("Not a file")
+        val entry = describe(documentId)
+        if (entry.isDirectory || !entry.file.isFile) throw FileNotFoundException("Not a file")
         val truncate = mode == "w" || mode == "wt" || mode == "rwt"
         val flags = when (mode) {
             "r" -> ParcelFileDescriptor.MODE_READ_ONLY
@@ -179,12 +206,12 @@ class WorkspaceDocumentsProvider : DocumentsProvider() {
             "rw", "rwt" -> ParcelFileDescriptor.MODE_READ_WRITE
             else -> throw FileNotFoundException("Unsupported mode")
         }
-        val descriptor = ParcelFileDescriptor.open(file, flags)
+        val descriptor = ParcelFileDescriptor.open(entry.file, flags)
         try {
             // Validate the opened descriptor as well, in case a running command
             // changed a symlink between path validation and open().
             val openedPath = Os.readlink("/proc/self/fd/${descriptor.fd}")
-            if (!WorkspaceDocumentPaths.isWithin(root.directory, File(openedPath))) {
+            if (!WorkspaceDocumentPaths.isWithin(entry.root, File(openedPath))) {
                 throw FileNotFoundException("Path outside workspace")
             }
             // Truncate only after the descriptor is known to be inside the
@@ -200,40 +227,317 @@ class WorkspaceDocumentsProvider : DocumentsProvider() {
 
     override fun getDocumentType(documentId: String): String {
         if (documentId == WorkspaceDocumentPaths.ROOT) return Document.MIME_TYPE_DIR
-        val (_, relative, file) = resolve(documentId)
-        return if (relative.isEmpty()) Document.MIME_TYPE_DIR else mimeType(file)
+        val entry = describe(documentId)
+        return if (entry.isDirectory) Document.MIME_TYPE_DIR else mimeType(entry.file)
     }
 
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean = try {
-        val (childRoot, _, childFile) = resolve(documentId)
-        if (parentDocumentId == WorkspaceDocumentPaths.ROOT) {
-            true
-        } else {
-            val (parentRoot, _, parentFile) = resolve(parentDocumentId)
-            parentRoot.id == childRoot.id && parentFile.isDirectory &&
-                WorkspaceDocumentPaths.isWithin(parentFile, childFile)
-        }
+        val parent = describe(parentDocumentId)
+        val child = describe(documentId)
+        parent.isDirectory && WorkspaceDocumentPaths.isWithin(parent.root, child.file)
     } catch (_: IOException) {
         false
     }
 
-    private fun resolve(documentId: String): Triple<WorkspaceDocumentRoot, String, File> {
-        val (id, relative) = WorkspaceDocumentPaths.parse(documentId)
-        val root = store.list().firstOrNull { it.id == id } ?: throw FileNotFoundException("Workspace no longer exists")
-        return Triple(root, relative, WorkspaceDocumentPaths.resolve(root, relative))
+    private fun parseOrThrow(documentId: String): DocumentTarget =
+        WorkspaceDocumentPaths.parse(documentId) ?: throw FileNotFoundException("Unknown document")
+
+    private fun describe(documentId: String, followLeaf: Boolean = true): DocumentEntry {
+        return when (val target = parseOrThrow(documentId)) {
+            DocumentTarget.Root -> DocumentEntry(
+                documentId, "Kelivo", appData, appData, isDirectory = true,
+            )
+            is DocumentTarget.Category -> categoryEntry(target.id)
+            is DocumentTarget.Workspace -> {
+                val workspace = store.list().firstOrNull { it.id == target.workspaceId }
+                    ?: throw FileNotFoundException("Workspace no longer exists")
+                val file = WorkspaceDocumentPaths.resolveInRoot(
+                    workspace.directory, target.relativePath, followLeaf,
+                )
+                if (target.relativePath.isEmpty()) {
+                    // A workspace restored without files stays an empty folder.
+                    DocumentEntry(
+                        documentId, workspace.name, file, workspace.directory, isDirectory = true,
+                        supportsCreate = true,
+                    )
+                } else {
+                    childEntry(documentId, file, workspace.directory)
+                }
+            }
+            is DocumentTarget.Session -> {
+                val directory = sessionDirectory(target.conversationId)
+                val file = WorkspaceDocumentPaths.resolveInRoot(
+                    directory, target.relativePath, followLeaf,
+                )
+                if (target.relativePath.isEmpty()) {
+                    DocumentEntry(
+                        documentId,
+                        sessionName(target.conversationId, directory),
+                        file,
+                        directory,
+                        isDirectory = true,
+                        supportsCreate = true,
+                        supportsDelete = true,
+                    )
+                } else {
+                    childEntry(documentId, file, directory)
+                }
+            }
+            is DocumentTarget.Output -> {
+                val directory = outputsDirectory(target.conversationId)
+                val file = WorkspaceDocumentPaths.resolveInRoot(
+                    directory, target.relativePath, followLeaf,
+                )
+                if (target.relativePath.isEmpty()) {
+                    DocumentEntry(
+                        documentId,
+                        sessionName(target.conversationId, directory.parentFile ?: directory),
+                        file,
+                        directory,
+                        isDirectory = true,
+                        supportsCreate = true,
+                        supportsDelete = true,
+                    )
+                } else {
+                    childEntry(documentId, file, directory)
+                }
+            }
+            is DocumentTarget.Rootfs -> {
+                val file = WorkspaceDocumentPaths.resolveInRoot(
+                    rootfsDir, target.relativePath, followLeaf,
+                )
+                if (target.relativePath.isEmpty()) {
+                    DocumentEntry(
+                        documentId, "rootfs", file, rootfsDir, isDirectory = true,
+                        supportsCreate = true,
+                    )
+                } else {
+                    childEntry(documentId, file, rootfsDir)
+                }
+            }
+        }
     }
 
-    private fun MatrixCursor.addDocument(root: WorkspaceDocumentRoot, relative: String, file: File) {
-        val isDirectory = relative.isEmpty() || file.isDirectory
-        var flags = if (isDirectory) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE
-        if (relative.isNotEmpty()) flags = flags or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+    private fun categoryEntry(id: String): DocumentEntry {
+        val file = when (id) {
+            WorkspaceDocumentPaths.CATEGORY_WORKSPACES -> workspacesDir
+            WorkspaceDocumentPaths.CATEGORY_SESSIONS,
+            WorkspaceDocumentPaths.CATEGORY_OUTPUTS,
+            -> sessionsDir
+            WorkspaceDocumentPaths.CATEGORY_ROOTFS -> rootfsDir
+            else -> throw FileNotFoundException("Unknown category")
+        }
+        return DocumentEntry(
+            id,
+            WorkspaceDocumentPaths.categoryTitle(id),
+            file,
+            file,
+            isDirectory = true,
+            supportsCreate = id == WorkspaceDocumentPaths.CATEGORY_ROOTFS,
+        )
+    }
+
+    private fun workspaceEntry(workspace: WorkspaceDocumentRoot): DocumentEntry = DocumentEntry(
+        WorkspaceDocumentPaths.documentId(workspace.id),
+        workspace.name,
+        workspace.directory,
+        workspace.directory,
+        isDirectory = true,
+        supportsCreate = true,
+    )
+
+    private fun childEntry(id: String, file: File, root: File): DocumentEntry {
+        val isDirectory = Files.isDirectory(file.toPath())
+        return DocumentEntry(
+            id,
+            file.name,
+            file,
+            root,
+            isDirectory = isDirectory,
+            supportsCreate = isDirectory,
+            supportsWrite = !isDirectory,
+            supportsDelete = true,
+            supportsRename = true,
+        )
+    }
+
+    private fun addChildren(cursor: MatrixCursor, parent: DocumentTarget, entry: DocumentEntry) {
+        val children = entry.file.listFiles().orEmpty()
+            .filterNot { it.name.startsWith(".l2s.") }
+            .sortedWith(compareBy<File> { !it.isDirectory }.thenBy { it.name.lowercase() })
+        for (child in children) {
+            val file = try {
+                WorkspaceDocumentPaths.resolveInRoot(entry.file, child.name)
+            } catch (_: IOException) {
+                // Files may disappear while enumerating. Escaping links and
+                // non-regular files are intentionally not exposed.
+                continue
+            }
+            cursor.addDocument(childEntry(childId(parent, child.name), file, entry.root))
+        }
+    }
+
+    private fun conversationEntries(outputsOnly: Boolean): List<DocumentEntry> {
+        if (!Files.isDirectory(sessionsDir.toPath())) return emptyList()
+        val created = store.conversations().associate { it.id to it.createdAtMillis }
+        val entries = mutableListOf<DocumentEntry>()
+        Files.newDirectoryStream(sessionsDir.toPath()).use { stream ->
+            for (path in stream) {
+                val id = path.fileName.toString()
+                if (!WorkspaceDocumentPaths.validId(id)) continue
+                if (!Files.isDirectory(path, NOFOLLOW_LINKS)) continue
+                val sessionDir = path.toFile()
+                val directory = if (outputsOnly) {
+                    try {
+                        WorkspaceDocumentPaths.resolveInRoot(sessionDir, "outputs")
+                    } catch (_: IOException) {
+                        continue
+                    }
+                } else {
+                    sessionDir
+                }
+                if (!Files.isDirectory(directory.toPath())) continue
+                entries += DocumentEntry(
+                    if (outputsOnly) {
+                        WorkspaceDocumentPaths.outputDocumentId(id)
+                    } else {
+                        WorkspaceDocumentPaths.sessionDocumentId(id)
+                    },
+                    sessionName(id, created[id] ?: creationMillis(sessionDir)),
+                    directory,
+                    directory,
+                    isDirectory = true,
+                    supportsCreate = true,
+                    supportsDelete = true,
+                )
+            }
+        }
+        // The display name starts with yyyyMMddHHmmss, so this sorts newest first.
+        return entries.sortedByDescending { it.name }
+    }
+
+    private fun sessionDirectory(conversationId: String): File =
+        WorkspaceDocumentPaths.resolveInRoot(sessionsDir, conversationId)
+
+    private fun outputsDirectory(conversationId: String): File =
+        WorkspaceDocumentPaths.resolveInRoot(sessionDirectory(conversationId), "outputs")
+
+    private fun sessionName(conversationId: String, createdAtMillis: Long): String {
+        val time = SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(Date(createdAtMillis))
+        return "$time-${conversationId.substringBefore('-').take(8)}"
+    }
+
+    private fun sessionName(conversationId: String, sessionDir: File): String =
+        sessionName(conversationId, creationMillis(sessionDir))
+
+    private fun creationMillis(file: File): Long {
+        val created = try {
+            Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+                .creationTime().toMillis()
+        } catch (_: IOException) {
+            0L
+        }
+        return if (created > 0) created else file.lastModified()
+    }
+
+    private fun childId(parent: DocumentTarget, name: String): String = when (parent) {
+        is DocumentTarget.Category -> {
+            if (parent.id == WorkspaceDocumentPaths.CATEGORY_ROOTFS) {
+                WorkspaceDocumentPaths.rootfsDocumentId(name)
+            } else {
+                throw FileNotFoundException("Folder is read-only")
+            }
+        }
+        is DocumentTarget.Workspace -> WorkspaceDocumentPaths.documentId(
+            parent.workspaceId, join(parent.relativePath, name),
+        )
+        is DocumentTarget.Session -> WorkspaceDocumentPaths.sessionDocumentId(
+            parent.conversationId, join(parent.relativePath, name),
+        )
+        is DocumentTarget.Output -> WorkspaceDocumentPaths.outputDocumentId(
+            parent.conversationId, join(parent.relativePath, name),
+        )
+        is DocumentTarget.Rootfs -> WorkspaceDocumentPaths.rootfsDocumentId(
+            join(parent.relativePath, name),
+        )
+        else -> throw FileNotFoundException("Folder is read-only")
+    }
+
+    private fun renamedId(documentId: String, name: String): String =
+        when (val target = parseOrThrow(documentId)) {
+            is DocumentTarget.Workspace -> WorkspaceDocumentPaths.documentId(
+                target.workspaceId, replaceName(target.relativePath, name),
+            )
+            is DocumentTarget.Session -> WorkspaceDocumentPaths.sessionDocumentId(
+                target.conversationId, replaceName(target.relativePath, name),
+            )
+            is DocumentTarget.Output -> WorkspaceDocumentPaths.outputDocumentId(
+                target.conversationId, replaceName(target.relativePath, name),
+            )
+            is DocumentTarget.Rootfs -> WorkspaceDocumentPaths.rootfsDocumentId(
+                replaceName(target.relativePath, name),
+            )
+            else -> throw FileNotFoundException("Cannot rename document")
+        }
+
+    private fun parentDocumentId(documentId: String): String =
+        when (val target = parseOrThrow(documentId)) {
+            is DocumentTarget.Workspace -> if (target.relativePath.contains('/')) {
+                WorkspaceDocumentPaths.documentId(
+                    target.workspaceId, target.relativePath.substringBeforeLast('/'),
+                )
+            } else {
+                WorkspaceDocumentPaths.CATEGORY_WORKSPACES
+            }
+            is DocumentTarget.Session -> if (target.relativePath.contains('/')) {
+                WorkspaceDocumentPaths.sessionDocumentId(
+                    target.conversationId, target.relativePath.substringBeforeLast('/'),
+                )
+            } else {
+                WorkspaceDocumentPaths.CATEGORY_SESSIONS
+            }
+            is DocumentTarget.Output -> if (target.relativePath.contains('/')) {
+                WorkspaceDocumentPaths.outputDocumentId(
+                    target.conversationId, target.relativePath.substringBeforeLast('/'),
+                )
+            } else {
+                WorkspaceDocumentPaths.CATEGORY_OUTPUTS
+            }
+            is DocumentTarget.Rootfs -> if (target.relativePath.contains('/')) {
+                WorkspaceDocumentPaths.rootfsDocumentId(target.relativePath.substringBeforeLast('/'))
+            } else {
+                WorkspaceDocumentPaths.CATEGORY_ROOTFS
+            }
+            else -> WorkspaceDocumentPaths.ROOT
+        }
+
+    private fun join(relativePath: String, name: String): String =
+        if (relativePath.isEmpty()) name else "$relativePath/$name"
+
+    private fun replaceName(relativePath: String, name: String): String =
+        join(relativePath.substringBeforeLast('/', ""), name)
+
+    private fun MatrixCursor.addDocument(entry: DocumentEntry) {
+        var flags = 0
+        if (entry.isDirectory) {
+            if (entry.supportsCreate) flags = flags or Document.FLAG_DIR_SUPPORTS_CREATE
+            // The top level is virtual; picking it as a tree would grant
+            // access to a folder that cannot hold files.
+            if (entry.id == WorkspaceDocumentPaths.ROOT && Build.VERSION.SDK_INT >= 30) {
+                flags = flags or Document.FLAG_DIR_BLOCKS_OPEN_DOCUMENT_TREE
+            }
+        } else if (entry.supportsWrite) {
+            flags = flags or Document.FLAG_SUPPORTS_WRITE
+        }
+        if (entry.supportsDelete) flags = flags or Document.FLAG_SUPPORTS_DELETE
+        if (entry.supportsRename) flags = flags or Document.FLAG_SUPPORTS_RENAME
         addValues(mapOf(
-            Document.COLUMN_DOCUMENT_ID to WorkspaceDocumentPaths.documentId(root.id, relative),
-            Document.COLUMN_DISPLAY_NAME to if (relative.isEmpty()) root.name else relative.substringAfterLast('/'),
-            Document.COLUMN_MIME_TYPE to if (isDirectory) Document.MIME_TYPE_DIR else mimeType(file),
+            Document.COLUMN_DOCUMENT_ID to entry.id,
+            Document.COLUMN_DISPLAY_NAME to entry.name,
+            Document.COLUMN_MIME_TYPE to if (entry.isDirectory) Document.MIME_TYPE_DIR else mimeType(entry.file),
             Document.COLUMN_FLAGS to flags,
-            Document.COLUMN_SIZE to if (file.isFile) file.length() else null,
-            Document.COLUMN_LAST_MODIFIED to file.lastModified().takeIf { it > 0 },
+            Document.COLUMN_SIZE to if (entry.file.isFile) entry.file.length() else null,
+            Document.COLUMN_LAST_MODIFIED to entry.file.lastModified().takeIf { it > 0 },
         ))
     }
 
